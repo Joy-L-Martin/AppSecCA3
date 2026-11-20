@@ -1,15 +1,36 @@
+from flask import abort
+import secrets
+from flask import session
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.security import check_password_hash
 from flask import Flask, render_template, request, redirect, flash, url_for
 from werkzeug.security import generate_password_hash
 
-from models import db, User, AppointmentSlot, Booking
+from models import db, User, AppointmentSlot, Booking, LoginSecurityEvent, UserSession, AccessSecurityEvent
+
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+
 
 app = Flask(__name__)
 
 # Application configuration
 app.config["SECRET_KEY"] = "local-development-key-change-later"
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///database.db"
+
+SESSION_TIMEOUT = timedelta(minutes=10)
+
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = False
+
+# Brute-force login protection settings
+MAX_FAILED_ATTEMPTS = 5
+FAILED_LOGIN_WINDOW = timedelta(minutes=30)
+LOGIN_LOCK_DURATION = timedelta(minutes=15)
+LOGIN_ERROR_MESSAGE = "Invalid login details or login temporarily unavailable."
+
 
 # Connect database to Flask
 db.init_app(app)
@@ -23,6 +44,52 @@ def load_user(user_id):
     return db.session.get(User, int(user_id))
 
 
+@app.before_request
+def validate_secure_session():
+
+    # Allow login, registration and home page without a session
+    if request.endpoint in ("login", "register", "home", "static"):
+        return
+
+    if not current_user.is_authenticated:
+        return
+
+    token = session.get("session_token")
+
+    if not token:
+        logout_user()
+        session.clear()
+        return redirect(url_for("login"))
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    stored_session = UserSession.query.filter_by(
+        user_id=current_user.id,
+        token_hash=token_hash
+    ).first()
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if stored_session is None:
+        logout_user()
+        session.clear()
+        return redirect(url_for("login"))
+
+    if now - stored_session.last_activity >= SESSION_TIMEOUT:
+
+        db.session.delete(stored_session)
+        db.session.commit()
+
+        logout_user()
+        session.clear()
+
+        return redirect(url_for("login"))
+
+    # Update activity timestamp
+    stored_session.last_activity = now
+    db.session.commit()
+
+
 # Create database tables
 with app.app_context():
     db.create_all()
@@ -33,6 +100,41 @@ def home():
     return render_template("index.html")
 
 
+def get_login_identifier(email):
+    # Generate a consistent identifier without storing the email
+    return hmac.new(
+        app.config["SECRET_KEY"].encode("utf-8"),
+        email.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def create_secure_session(user):
+
+    # Generate a cryptographically secure random token
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    # Replace any existing session for this user
+    UserSession.query.filter_by(user_id=user.id).delete()
+
+    new_session = UserSession(
+        user_id=user.id,
+        token_hash=token_hash,
+        last_activity=datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+
+    db.session.add(new_session)
+    db.session.commit()
+
+    # Clear previous Flask session information
+    session.clear()
+
+    # Store the token in Flask's signed session cookie
+    session["session_token"] = token
+
+    login_user(user)
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -42,16 +144,75 @@ def login():
         email = request.form["email"].strip().lower()
         password = request.form["password"]
 
+        identifier = get_login_identifier(email)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # Check for an active login restriction
+        active_lock = LoginSecurityEvent.query.filter(
+            LoginSecurityEvent.identifier_hash == identifier,
+            LoginSecurityEvent.event_type == "restricted",
+            LoginSecurityEvent.locked_until > now
+        ).first()
+
+        if active_lock:
+            db.session.add(LoginSecurityEvent(
+                identifier_hash=identifier,
+                event_type="blocked",
+                occurred_at=now
+            ))
+            db.session.commit()
+
+            flash(LOGIN_ERROR_MESSAGE, "danger")
+            return redirect(url_for("login"))
+
+        # Check submitted credentials
         user = User.query.filter_by(email=email).first()
 
         if user and check_password_hash(user.password_hash, password):
-            login_user(user)
+
+            # Clear previous failures after a successful login
+            LoginSecurityEvent.query.filter(
+                LoginSecurityEvent.identifier_hash == identifier,
+                LoginSecurityEvent.event_type == "failed"
+            ).delete(synchronize_session=False)
+
+            db.session.commit()
+
+            create_secure_session(user)
             return redirect(url_for("dashboard"))
 
-        flash("Invalid email or password.", "danger")
+        # Record the failed login
+        db.session.add(LoginSecurityEvent(
+            identifier_hash=identifier,
+            event_type="failed",
+            occurred_at=now
+        ))
+        db.session.flush()
+
+        # Count failures within the last 30 minutes
+        window_start = now - FAILED_LOGIN_WINDOW
+
+        failed_count = LoginSecurityEvent.query.filter(
+            LoginSecurityEvent.identifier_hash == identifier,
+            LoginSecurityEvent.event_type == "failed",
+            LoginSecurityEvent.occurred_at >= window_start
+        ).count()
+
+        # Restrict login after five failed attempts
+        if failed_count >= MAX_FAILED_ATTEMPTS:
+
+            db.session.add(LoginSecurityEvent(
+                identifier_hash=identifier,
+                event_type="restricted",
+                occurred_at=now,
+                locked_until=now + LOGIN_LOCK_DURATION
+            ))
+
+        db.session.commit()
+
+        flash(LOGIN_ERROR_MESSAGE, "danger")
 
     return render_template("login.html")
-
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -98,16 +259,32 @@ def dashboard():
     return render_template("dashboard.html")
 
 
+
 @app.route("/logout", methods=["POST"])
 @login_required
 def logout():
+
+    # Invalidate the active token in the database
+    UserSession.query.filter_by(
+        user_id=current_user.id
+    ).delete()
+
+    db.session.commit()
+
     logout_user()
+    session.clear()
+
     return redirect(url_for("home"))
+
 
 
 @app.route("/book")
 @login_required
 def book():
+    if current_user.role != "customer":
+        log_unauthorised_access("unauthorised_booking_access")
+        abort(403)
+
     slots = AppointmentSlot.query.filter_by(
         is_available=True
     ).order_by(
@@ -118,9 +295,15 @@ def book():
     return render_template("book.html", slots=slots)
 
 
+
+
 @app.route("/book/<int:slot_id>", methods=["POST"])
 @login_required
 def book_slot(slot_id):
+
+    if current_user.role != "customer":
+        log_unauthorised_access("unauthorised_booking_access")
+        abort(403)
 
     slot = db.session.get(AppointmentSlot, slot_id)
 
@@ -143,12 +326,39 @@ def book_slot(slot_id):
     return redirect(url_for("dashboard"))
 
 
+def log_unauthorised_access(event_type):
+
+    event = AccessSecurityEvent(
+        user_id=current_user.id if current_user.is_authenticated else None,
+        event_type=event_type,
+        endpoint=request.endpoint or "unknown",
+        occurred_at=datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+
+    db.session.add(event)
+    db.session.commit()
+
+
+def require_admin():
+
+    if current_user.role != "admin":
+        log_unauthorised_access("unauthorised_admin_access")
+        abort(403)
+
+
+
+def require_booking_owner(booking):
+
+    if current_user.role != "customer" or booking.user_id != current_user.id:
+        log_unauthorised_access("unauthorised_booking_access")
+        abort(403)
+
+
 @app.route("/admin", methods=["GET", "POST"])
 @login_required
 def admin():
 
-    if current_user.role != "admin":
-        return redirect(url_for("dashboard"))
+    require_admin()
 
     if request.method == "POST":
 
@@ -180,8 +390,7 @@ def admin():
 @login_required
 def edit_slot(slot_id):
 
-    if current_user.role != "admin":
-        return redirect(url_for("dashboard"))
+    require_admin()
 
     slot = db.get_or_404(AppointmentSlot, slot_id)
 
@@ -206,8 +415,7 @@ def edit_slot(slot_id):
 @login_required
 def delete_slot(slot_id):
 
-    if current_user.role != "admin":
-        return redirect(url_for("dashboard"))
+    require_admin()
 
     slot = db.get_or_404(AppointmentSlot, slot_id)
 
@@ -223,10 +431,13 @@ def delete_slot(slot_id):
     return redirect(url_for("admin"))
 
 
-
 @app.route("/my-appointments")
 @login_required
 def my_appointments():
+
+    if current_user.role != "customer":
+        log_unauthorised_access("unauthorised_booking_access")
+        abort(403)
 
     bookings = Booking.query.filter_by(
         user_id=current_user.id
@@ -244,14 +455,10 @@ def cancel_booking(booking_id):
 
     booking = db.get_or_404(Booking, booking_id)
 
-    if booking.user_id != current_user.id:
-        flash("You cannot cancel this appointment.", "danger")
-        return redirect(url_for("my_appointments"))
+    require_booking_owner(booking)
 
-    # Make the appointment slot available again
     booking.slot.is_available = True
 
-    # Remove the booking
     db.session.delete(booking)
     db.session.commit()
 

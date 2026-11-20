@@ -54,3 +54,78 @@ class Booking(db.Model):
 
     user = db.relationship("User")
     slot = db.relationship("AppointmentSlot")
+
+class LoginSecurityEvent(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+
+    # Hashed email identifier, not the actual email
+    identifier_hash = db.Column(
+        db.String(64),
+        nullable=False,
+        index=True
+    )
+
+    # Examples: failed, restricted, blocked
+    event_type = db.Column(
+        db.String(20),
+        nullable=False
+    )
+
+    # Time the event happened (UTC)
+    occurred_at = db.Column(
+        db.DateTime,
+        nullable=False
+    )
+
+    # When a temporary restriction ends
+    locked_until = db.Column(
+        db.DateTime,
+        nullable=True
+    )
+
+
+class UserSession(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id"),
+        unique=True,
+        nullable=False
+    )
+
+    token_hash = db.Column(
+        db.String(64),
+        unique=True,
+        nullable=False
+    )
+
+    last_activity = db.Column(
+        db.DateTime,
+        nullable=False
+    )
+
+
+class AccessSecurityEvent(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id"),
+        nullable=True
+    )
+
+    event_type = db.Column(
+        db.String(50),
+        nullable=False
+    )
+
+    endpoint = db.Column(
+        db.String(100),
+        nullable=False
+    )
+
+    occurred_at = db.Column(
+        db.DateTime,
+        nullable=False
+    )
