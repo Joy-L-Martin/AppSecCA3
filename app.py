@@ -1,3 +1,4 @@
+import os
 from flask import abort
 import secrets
 from flask import session
@@ -16,8 +17,22 @@ import hmac
 app = Flask(__name__)
 
 # Application configuration
-app.config["SECRET_KEY"] = "local-development-key-change-later"
+
+# Application configuration
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY")
+
+if not app.config["SECRET_KEY"]:
+    raise RuntimeError("FLASK_SECRET_KEY environment variable is not set.")
+
+app.config["LOGIN_IDENTIFIER_KEY"] = os.environ.get("LOGIN_IDENTIFIER_KEY")
+
+if not app.config["LOGIN_IDENTIFIER_KEY"]:
+    raise RuntimeError("LOGIN_IDENTIFIER_KEY environment variable is not set.")
+
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///database.db"
+
+
+
 
 SESSION_TIMEOUT = timedelta(minutes=10)
 
@@ -100,13 +115,15 @@ def home():
     return render_template("index.html")
 
 
+
 def get_login_identifier(email):
     # Generate a consistent identifier without storing the email
     return hmac.new(
-        app.config["SECRET_KEY"].encode("utf-8"),
+        app.config["LOGIN_IDENTIFIER_KEY"].encode("utf-8"),
         email.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
+
 
 
 def create_secure_session(user):
